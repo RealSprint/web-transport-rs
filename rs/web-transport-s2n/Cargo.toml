@@ -1,0 +1,52 @@
+[package]
+name = "web-transport-s2n"
+description = "WebTransport library for s2n-quic"
+authors = ["Luke Curley"]
+repository = "https://github.com/moq-dev/web-transport"
+license = "MIT OR Apache-2.0"
+
+version = "0.0.1"
+edition = "2021"
+
+keywords = ["quic", "http3", "webtransport"]
+categories = ["network-programming", "web-programming"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+bytes = "1"
+futures = "0.3"
+http = "1"
+
+s2n-quic = { version = "1", default-features = false, features = [
+    "provider-address-token-default",
+    "provider-tls-rustls",
+    "unstable-provider-datagram",
+] }
+
+# Must match the rustls version that s2n-quic's rustls provider pins.
+rustls = { version = "0.23", default-features = false, features = [
+    "logging",
+    "std",
+    "aws-lc-rs",
+] }
+rustls-native-certs = "0.8"
+thiserror = "2"
+
+tokio = { version = "1", default-features = false, features = [
+    "io-util",
+    "macros",
+    "time",
+    "net",
+    "rt",
+    "sync",
+] }
+tracing = "0.1"
+url = "2"
+web-transport-proto = { workspace = true }
+web-transport-trait = { workspace = true }
+
+[dev-dependencies]
+rcgen = "0.13"
+tokio = { version = "1", features = ["full"] }

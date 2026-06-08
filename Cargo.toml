@@ -9,6 +9,7 @@ members = [
     "rs/web-transport-proto",
     "rs/web-transport-quiche",
     "rs/web-transport-quinn",
+    "rs/web-transport-s2n",
     "rs/web-transport-trait",
     "rs/web-transport-wasm",
 ]
