@@ -22,8 +22,9 @@ use crate::{
     WebTransportError,
 };
 
-/// A conservative datagram payload limit. s2n-quic does not publicly expose the peer's
-/// `max_datagram_frame_size`, so we use the QUIC minimum guaranteed datagram size.
+/// A conservative datagram payload limit, using the QUIC minimum guaranteed datagram
+/// size rather than the peer's actual negotiated limit (available via
+/// `Sender::max_packet_space()` on the datagram provider, not read here).
 const DEFAULT_MAX_DATAGRAM_SIZE: usize = 1200;
 
 /// An established WebTransport session, acting like a QUIC connection.
@@ -272,8 +273,9 @@ impl Session {
 
     /// The maximum size of a datagram that can be sent.
     ///
-    /// NOTE: s2n-quic does not expose the peer's datagram limit, so this is a conservative
-    /// estimate based on the QUIC minimum. Larger datagrams may still succeed.
+    /// NOTE: this is a conservative estimate based on the QUIC minimum, not the peer's
+    /// actual negotiated limit (see [`DEFAULT_MAX_DATAGRAM_SIZE`]). Larger datagrams may
+    /// still succeed.
     pub fn max_datagram_size(&self) -> usize {
         DEFAULT_MAX_DATAGRAM_SIZE.saturating_sub(self.header_datagram.len())
     }
