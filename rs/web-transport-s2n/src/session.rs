@@ -278,6 +278,18 @@ impl Session {
         DEFAULT_MAX_DATAGRAM_SIZE.saturating_sub(self.header_datagram.len())
     }
 
+    /// Enable or disable QUIC keep-alive PING frames on this session's connection.
+    ///
+    /// Idle WebTransport sessions emit no application data, so without keep-alives a short
+    /// `max_idle_timeout` reaps quiet-but-live sessions. Enabling this lets servers run
+    /// aggressive idle timeouts (e.g. 10 s) without dropping idle sessions.
+    pub fn keep_alive(&self, enabled: bool) -> Result<(), SessionError> {
+        self.handle
+            .clone()
+            .keep_alive(enabled)
+            .map_err(|e| SessionError::ConnectionError(e.into()))
+    }
+
     /// Close the session with an error code and reason.
     ///
     /// A `CloseWebTransportSession` capsule is written on the CONNECT stream before the QUIC
