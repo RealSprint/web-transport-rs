@@ -66,18 +66,44 @@ impl ServerBuilder {
     }
 }
 
-/// Maximum concurrent in-flight H3/WebTransport handshakes (accepted QUIC
-/// connections that haven't yet produced a [`Request`]). Without a cap, a peer
-/// that finishes the QUIC handshake and then stalls (no control stream, no
-/// CONNECT) pins state here indefinitely - cheap slowloris. 256 is generous for
-/// legitimate handshake concurrency (these normally resolve in well under a
-/// second) while bounding worst-case pinned state on one endpoint.
+/// Maximum number of H3/WebTransport handshakes (accepted QUIC connections that
+/// haven't yet produced a [`Request`]) that [`Server::accept`] drives at once.
+/// Without a cap, a peer that finishes the QUIC handshake and then stalls (no
+/// control stream, no CONNECT) pins state here indefinitely - cheap slowloris.
+/// 256 is generous for legitimate handshake concurrency (these normally resolve
+/// in well under a second).
+///
+/// Because [`Server::accept`] always dequeues from the underlying endpoint and
+/// closes anything over this cap on arrival, this is a hard bound on the
+/// handshake state one endpoint can pin. Gating `s2n_quic::Server::accept`
+/// instead would not bound it: over-cap connections would sit undriven in
+/// s2n-quic's own unbounded accept queue with [`HANDSHAKE_TIMEOUT`] not yet
+/// started, and new sessions would queue behind stalled ones.
 const MAX_INFLIGHT_SESSION_HANDSHAKES: usize = 256;
 
 /// Per-handshake timeout for [`Request::accept`] (the H3 SETTINGS/CONNECT
-/// exchange), so a stalled peer can't hold an in-flight slot forever. QUIC's own
+/// exchange), so a stalled peer can't hold a driven slot forever. QUIC's own
 /// `max_handshake_duration` only covers the transport handshake, not this stage.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// All this stage covers is one round trip plus SETTINGS on an already-connected
+/// path, so 3s is well clear of any plausible legitimate exchange while keeping
+/// slot turnover quick.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// `H3_EXCESSIVE_LOAD` from the HTTP/3 error space (RFC 9114, section 8.1), used
+/// to close connections arriving while [`MAX_INFLIGHT_SESSION_HANDSHAKES`]
+/// handshakes are already being driven. It is the H3 layer that is out of
+/// capacity and no WebTransport session exists yet, so this is a raw HTTP/3 code
+/// rather than a WebTransport code mapped through
+/// [`web_transport_proto::error_to_http3`].
+const H3_EXCESSIVE_LOAD: u64 = 0x0107;
+
+/// Whether a freshly dequeued connection may join the driven handshake set.
+///
+/// Split out from [`Server::accept`] so the admission boundary is testable
+/// without a live endpoint.
+fn has_handshake_capacity(driven: usize) -> bool {
+    driven < MAX_INFLIGHT_SESSION_HANDSHAKES
+}
 
 /// A WebTransport server that accepts new sessions.
 pub struct Server {
@@ -105,12 +131,22 @@ impl Server {
     pub async fn accept(&mut self) -> Option<Request> {
         loop {
             tokio::select! {
-                // Backpressure, not rejection: stop polling for new QUIC connections
-                // once MAX_INFLIGHT_SESSION_HANDSHAKES are already handshaking, so the
-                // in-flight set can never grow past the cap. Cheaper and simpler than
-                // accepting the connection and then tearing it down over the cap.
-                conn = self.endpoint.accept(), if self.accept.len() < MAX_INFLIGHT_SESSION_HANDSHAKES => {
+                // Always dequeue: the endpoint's accept queue is unbounded and the
+                // connections in it are undriven, so leaving them there would neither
+                // bound pinned state nor keep fresh sessions from queueing behind
+                // stalled handshakes.
+                conn = self.endpoint.accept() => {
                     let conn = conn?;
+                    if !has_handshake_capacity(self.accept.len()) {
+                        // Over capacity: reject explicitly rather than pinning state.
+                        // Each rejection is bounded work on a connection this iteration
+                        // actually consumed, so a hot accept stream can't spin the loop.
+                        conn.close(
+                            s2n_quic::application::Error::new(H3_EXCESSIVE_LOAD)
+                                .expect("h3 error code within varint range"),
+                        );
+                        continue;
+                    }
                     self.accept.push(Box::pin(async move {
                         tokio::time::timeout(HANDSHAKE_TIMEOUT, Request::accept(conn))
                             .await
@@ -208,29 +244,60 @@ impl core::ops::Deref for Request {
 mod tests {
     use super::*;
 
-    /// Shape test for `Server::accept`'s backpressure guard (`self.accept.len() <
-    /// MAX_INFLIGHT_SESSION_HANDSHAKES`), against the real constant. A full
+    /// The admission boundary `Server::accept` applies to every dequeued
+    /// connection, exercised against the real constant.
+    #[test]
+    fn handshake_capacity_does_not_off_by_one_at_the_cap() {
+        assert!(has_handshake_capacity(0));
+        assert!(has_handshake_capacity(MAX_INFLIGHT_SESSION_HANDSHAKES - 1));
+        assert!(!has_handshake_capacity(MAX_INFLIGHT_SESSION_HANDSHAKES));
+        assert!(!has_handshake_capacity(MAX_INFLIGHT_SESSION_HANDSHAKES + 1));
+    }
+
+    /// Shape test for `Server::accept`'s over-capacity behaviour: connections are
+    /// dequeued unconditionally, and those over the cap are closed instead of
+    /// joining the driven set (and instead of being left queued). A full
     /// end-to-end test would mean driving `MAX_INFLIGHT_SESSION_HANDSHAKES + 1`
     /// real, stalled QUIC handshakes through an actual `s2n_quic::Server` (whose
-    /// concrete type can't be substituted) and waiting out `HANDSHAKE_TIMEOUT` to
-    /// observe recovery - a real slowloris simulation, which the task explicitly
-    /// doesn't require. This instead proves the exact guard expression admits no
-    /// more than the cap and never off-by-ones at the boundary.
+    /// concrete type can't be substituted) - a real slowloris simulation, which
+    /// the task explicitly doesn't require. This instead proves the driven set
+    /// saturates at the cap while the accept queue keeps draining.
     #[test]
-    fn accept_backpressure_never_exceeds_the_inflight_cap() {
-        let in_flight: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
-        let mut offered = 0usize;
+    fn connections_over_the_cap_are_rejected_rather_than_queued() {
+        let driven: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
+        let offered = MAX_INFLIGHT_SESSION_HANDSHAKES * 4;
+        let mut dequeued = 0usize;
+        let mut rejected = 0usize;
 
-        // Offer far more "new connections" than the cap; only push while under it -
-        // the same guard `Server::accept` uses before calling `self.endpoint.accept()`.
-        for _ in 0..(MAX_INFLIGHT_SESSION_HANDSHAKES * 4) {
-            if in_flight.len() < MAX_INFLIGHT_SESSION_HANDSHAKES {
-                offered += 1;
-                in_flight.push(Box::pin(std::future::pending()));
+        // Offer far more "new connections" than the cap. Unlike the previous gated
+        // design, every one is dequeued; the decision is only whether it is driven.
+        for _ in 0..offered {
+            dequeued += 1;
+            if has_handshake_capacity(driven.len()) {
+                driven.push(Box::pin(std::future::pending()));
+            } else {
+                rejected += 1;
             }
         }
 
-        assert_eq!(in_flight.len(), MAX_INFLIGHT_SESSION_HANDSHAKES);
-        assert_eq!(offered, MAX_INFLIGHT_SESSION_HANDSHAKES);
+        assert_eq!(dequeued, offered, "every connection must be dequeued");
+        assert_eq!(driven.len(), MAX_INFLIGHT_SESSION_HANDSHAKES);
+        assert_eq!(rejected, offered - MAX_INFLIGHT_SESSION_HANDSHAKES);
+    }
+
+    /// The over-capacity close code is a valid application error code, so the
+    /// `expect` on the rejection path in `Server::accept` cannot fire.
+    #[test]
+    fn the_over_capacity_close_code_is_h3_excessive_load() {
+        let error = s2n_quic::application::Error::new(H3_EXCESSIVE_LOAD)
+            .expect("h3 error code within varint range");
+        assert_eq!(u64::from(error), 0x0107);
+    }
+
+    /// The H3 stage covers one round trip plus SETTINGS, so the timeout stays
+    /// short enough that a stalled peer frees its slot quickly.
+    #[test]
+    fn the_handshake_timeout_stays_short() {
+        assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(3));
     }
 }
