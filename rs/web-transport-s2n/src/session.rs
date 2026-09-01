@@ -280,6 +280,13 @@ impl Session {
         DEFAULT_MAX_DATAGRAM_SIZE.saturating_sub(self.header_datagram.len())
     }
 
+    /// Returns the address of the peer on the other end of this session.
+    pub fn remote_addr(&self) -> Result<std::net::SocketAddr, SessionError> {
+        self.handle
+            .remote_addr()
+            .map_err(SessionError::ConnectionError)
+    }
+
     /// Enable or disable QUIC keep-alive PING frames on this session's connection.
     ///
     /// Idle WebTransport sessions emit no application data, so without keep-alives a short

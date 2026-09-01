@@ -186,6 +186,14 @@ impl Request {
     pub fn connect(&self) -> &ConnectRequest {
         &self.connect.request
     }
+
+    /// Returns the address of the peer that opened this connection.
+    ///
+    /// Available before the accept/reject decision, so servers can apply per-IP policy
+    /// (abuse blocking, geo attribution, access logs) to a request they may still reject.
+    pub fn remote_addr(&self) -> Result<std::net::SocketAddr, ServerError> {
+        Ok(self.handle.remote_addr()?)
+    }
 }
 
 impl core::ops::Deref for Request {
