@@ -42,6 +42,10 @@ impl ServerBuilder {
     }
 
     /// Bound the in-flight H3/WebTransport handshakes; see [`HandshakeLimits`].
+    ///
+    /// # Panics
+    ///
+    /// `with_certificate` panics if `limits.max_inflight` is 0; see [`Server::with_limits`].
     pub fn with_handshake_limits(self, limits: HandshakeLimits) -> Self {
         Self { limits, ..self }
     }
@@ -177,7 +181,7 @@ pub struct HandshakeStats {
     pub timed_out: u64,
     /// Handshakes that ended in any other error (peer closed, protocol error).
     pub failed: u64,
-    /// Handshakes in flight right now.
+    /// Handshakes in flight as of the last `Server::accept` poll.
     pub inflight: usize,
     /// The largest `inflight` observed since the server was created.
     pub inflight_high_water: usize,
@@ -230,6 +234,11 @@ const _: () = assert!(DEFAULT_HANDSHAKE_TIMEOUT.as_secs() >= 10);
 /// rather than a WebTransport code mapped through
 /// [`web_transport_proto::error_to_http3`].
 const H3_EXCESSIVE_LOAD: u64 = 0x0107;
+
+/// After this many consecutive over-capacity rejections, `accept` yields to the
+/// runtime before dequeuing more, so a flood of connections cannot hold the
+/// worker for an unbounded stretch.
+const REJECTION_YIELD_BATCH: usize = 128;
 
 /// Whether a freshly dequeued connection may join the driven handshake set.
 ///
@@ -289,35 +298,17 @@ impl Server {
     }
 
     /// Accept a new WebTransport session [`Request`] from a client.
+    ///
+    /// Completed handshakes are polled before new connections so a stream of
+    /// arrivals cannot delay a session that is already ready. Every dequeued
+    /// connection is either driven or closed on the spot; see
+    /// [`HandshakeLimits`] for the bounds applied.
     pub async fn accept(&mut self) -> Option<Request> {
+        let mut consecutive_rejections = 0usize;
         loop {
             tokio::select! {
-                // Always dequeue: the endpoint's accept queue is unbounded and the
-                // connections in it are undriven, so leaving them there would neither
-                // bound pinned state nor keep fresh sessions from queueing behind
-                // stalled handshakes.
-                conn = self.endpoint.accept() => {
-                    let conn = conn?;
-                    if !has_handshake_capacity(self.accept.len(), self.limits.max_inflight) {
-                        // Over capacity: reject explicitly rather than pinning state.
-                        // Each rejection is bounded work on a connection this iteration
-                        // actually consumed, so a hot accept stream can't spin the loop.
-                        conn.close(
-                            s2n_quic::application::Error::new(H3_EXCESSIVE_LOAD)
-                                .expect("h3 error code within varint range"),
-                        );
-                        self.counters.rejected.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    let timeout = self.limits.timeout;
-                    self.accept.push(Box::pin(async move {
-                        tokio::time::timeout(timeout, Request::accept(conn))
-                            .await
-                            .unwrap_or(Err(ServerError::HandshakeTimeout))
-                    }));
-                    self.counters.admitted.fetch_add(1, Ordering::Relaxed);
-                    self.counters.set_inflight(self.accept.len());
-                }
+                biased;
+
                 Some(res) = self.accept.next() => {
                     self.counters.set_inflight(self.accept.len());
                     match res {
@@ -332,6 +323,42 @@ impl Server {
                             self.counters.failed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
+                }
+
+                // Always dequeue: the endpoint's accept queue is unbounded and the
+                // connections in it are undriven, so leaving them there would neither
+                // bound pinned state nor keep fresh sessions from queueing behind
+                // stalled handshakes.
+                conn = self.endpoint.accept() => {
+                    let conn = conn?;
+                    // The timeout runs from here, not from the handshake's first poll.
+                    let deadline = tokio::time::Instant::now() + self.limits.timeout;
+
+                    if !has_handshake_capacity(self.accept.len(), self.limits.max_inflight) {
+                        // Over capacity: reject explicitly rather than pinning state.
+                        // Each rejection is bounded work on a connection this iteration
+                        // actually consumed, so a hot accept stream can't spin the loop.
+                        conn.close(
+                            s2n_quic::application::Error::new(H3_EXCESSIVE_LOAD)
+                                .expect("h3 error code within varint range"),
+                        );
+                        self.counters.rejected.fetch_add(1, Ordering::Relaxed);
+                        consecutive_rejections += 1;
+                        if consecutive_rejections >= REJECTION_YIELD_BATCH {
+                            consecutive_rejections = 0;
+                            tokio::task::yield_now().await;
+                        }
+                        continue;
+                    }
+                    consecutive_rejections = 0;
+
+                    self.accept.push(Box::pin(async move {
+                        tokio::time::timeout_at(deadline, Request::accept(conn))
+                            .await
+                            .unwrap_or(Err(ServerError::HandshakeTimeout))
+                    }));
+                    self.counters.admitted.fetch_add(1, Ordering::Relaxed);
+                    self.counters.set_inflight(self.accept.len());
                 }
             }
         }
