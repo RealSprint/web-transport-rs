@@ -89,7 +89,7 @@ impl ServerBuilder {
 /// endpoint, 1350 clients connecting together drive the set to **1347**
 /// concurrent handshakes before any completes. A cap sized for "normal
 /// handshake concurrency" (an earlier revision used 256) therefore rejects the
-/// bulk of an ordinary viewer surge: those 1350 clients yielded 260 sessions
+/// bulk of an ordinary connect surge: those 1350 clients yielded 260 sessions
 /// and 1090 `H3_EXCESSIVE_LOAD` closes.
 ///
 /// 8192 is sized as a DoS backstop rather than a capacity limit - roughly 6x
@@ -122,7 +122,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MEASURED_BENIGN_BURST: usize = 1347;
 
 // The cap is a DoS backstop, not a capacity limit: keep it clear of a benign
-// burst, or an ordinary viewer surge gets H3_EXCESSIVE_LOAD instead of a session.
+// burst, or an ordinary connect surge gets H3_EXCESSIVE_LOAD instead of a session.
 #[cfg(test)]
 const _: () = assert!(MAX_INFLIGHT_SESSION_HANDSHAKES >= MEASURED_BENIGN_BURST * 4);
 
