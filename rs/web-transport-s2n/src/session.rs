@@ -280,6 +280,23 @@ impl Session {
         DEFAULT_MAX_DATAGRAM_SIZE.saturating_sub(self.header_datagram.len())
     }
 
+    /// Read this connection's [`Subscriber`](s2n_quic::provider::event::Subscriber)
+    /// `ConnectionContext`.
+    ///
+    /// s2n-quic reports connection statistics by *pushing* events into a subscriber
+    /// registered on the endpoint, which is the opposite of quinn's pull-based
+    /// `Connection::stats()` accessor. There is no useful
+    /// backend-agnostic snapshot this crate could take on its own: the shape of what is
+    /// accumulated is entirely up to the subscriber the endpoint was built with. So rather
+    /// than pick one here, this exposes the read side generically - the application owns
+    /// both the subscriber and the context type `C`.
+    ///
+    /// Returns `None` when the endpoint has no subscriber whose `ConnectionContext` is `C`
+    /// (including the default, event-less endpoint) or when the connection has gone away.
+    pub fn query_event_context<C: 'static, R>(&self, query: impl FnOnce(&C) -> R) -> Option<R> {
+        self.handle.query_event_context(query).ok()
+    }
+
     /// Returns the address of the peer on the other end of this session.
     pub fn remote_addr(&self) -> Result<std::net::SocketAddr, SessionError> {
         self.handle
