@@ -70,8 +70,6 @@ impl ServerBuilder {
 /// haven't yet produced a [`Request`]) that [`Server::accept`] drives at once.
 /// Without a cap, a peer that finishes the QUIC handshake and then stalls (no
 /// control stream, no CONNECT) pins state here indefinitely - cheap slowloris.
-/// 256 is generous for legitimate handshake concurrency (these normally resolve
-/// in well under a second).
 ///
 /// Because [`Server::accept`] always dequeues from the underlying endpoint and
 /// closes anything over this cap on arrival, this is a hard bound on the
@@ -79,15 +77,59 @@ impl ServerBuilder {
 /// instead would not bound it: over-cap connections would sit undriven in
 /// s2n-quic's own unbounded accept queue with [`HANDSHAKE_TIMEOUT`] not yet
 /// started, and new sessions would queue behind stalled ones.
-const MAX_INFLIGHT_SESSION_HANDSHAKES: usize = 256;
+///
+/// # Sizing: burst, not steady-state concurrency
+///
+/// Rejecting on arrival means this cap bounds the largest *burst* of
+/// simultaneous connects the endpoint will admit, not its steady-state
+/// handshake concurrency. The set grows to roughly
+/// `arrival_rate × handshake_latency` before the first handshake retires, and
+/// during a burst both factors are at their worst: everything arrives at once
+/// and each H3 exchange is queued behind all the others. Measured on one
+/// endpoint, 1350 clients connecting together drive the set to **1347**
+/// concurrent handshakes before any completes. A cap sized for "normal
+/// handshake concurrency" (an earlier revision used 256) therefore rejects the
+/// bulk of an ordinary viewer surge: those 1350 clients yielded 260 sessions
+/// and 1090 `H3_EXCESSIVE_LOAD` closes.
+///
+/// 8192 is sized as a DoS backstop rather than a capacity limit - roughly 6x
+/// the largest benign burst measured per endpoint, and comparable to the
+/// endpoint's own inflight-QUIC-handshake limit. Combined with
+/// [`HANDSHAKE_TIMEOUT`], the adversarial worst case is 8192 pinned H3
+/// handshakes per endpoint, each self-freeing within the timeout. Deployments
+/// that shard one port across N endpoints should size against `N ×` this value.
+const MAX_INFLIGHT_SESSION_HANDSHAKES: usize = 8192;
 
 /// Per-handshake timeout for [`Request::accept`] (the H3 SETTINGS/CONNECT
 /// exchange), so a stalled peer can't hold a driven slot forever. QUIC's own
 /// `max_handshake_duration` only covers the transport handshake, not this stage.
-/// All this stage covers is one round trip plus SETTINGS on an already-connected
-/// path, so 3s is well clear of any plausible legitimate exchange while keeping
-/// slot turnover quick.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+///
+/// Kept at 10s rather than trimmed to the round trip this stage nominally
+/// costs: its slowest case is precisely the connect burst the cap above is
+/// meant to survive, where a slot's H3 exchange waits behind every other
+/// in-flight handshake on the endpoint. Since
+/// [`MAX_INFLIGHT_SESSION_HANDSHAKES`] already bounds how many slots exist, the
+/// timeout only sets how long one stalled peer holds one - worth spending to
+/// keep a legitimate client from being dropped mid-handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The largest benign connect burst measured against one endpoint: 1350 clients
+/// connecting together drove [`Server::accept`]'s driven set to 1347 concurrent
+/// handshakes before the first one retired. Only a reference point for the two
+/// guards below - connections over the cap are closed rather than queued, so
+/// both constants have to clear a burst of this shape by a wide margin.
+#[cfg(test)]
+const MEASURED_BENIGN_BURST: usize = 1347;
+
+// The cap is a DoS backstop, not a capacity limit: keep it clear of a benign
+// burst, or an ordinary viewer surge gets H3_EXCESSIVE_LOAD instead of a session.
+#[cfg(test)]
+const _: () = assert!(MAX_INFLIGHT_SESSION_HANDSHAKES >= MEASURED_BENIGN_BURST * 4);
+
+// The timeout has to outlast an H3 exchange queued behind a full burst of other
+// in-flight handshakes, not just the single round trip it nominally costs.
+#[cfg(test)]
+const _: () = assert!(HANDSHAKE_TIMEOUT.as_secs() >= 10);
 
 /// `H3_EXCESSIVE_LOAD` from the HTTP/3 error space (RFC 9114, section 8.1), used
 /// to close connections arriving while [`MAX_INFLIGHT_SESSION_HANDSHAKES`]
@@ -292,12 +334,5 @@ mod tests {
         let error = s2n_quic::application::Error::new(H3_EXCESSIVE_LOAD)
             .expect("h3 error code within varint range");
         assert_eq!(u64::from(error), 0x0107);
-    }
-
-    /// The H3 stage covers one round trip plus SETTINGS, so the timeout stays
-    /// short enough that a stalled peer frees its slot quickly.
-    #[test]
-    fn the_handshake_timeout_stays_short() {
-        assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(3));
     }
 }
