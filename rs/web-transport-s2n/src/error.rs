@@ -173,6 +173,9 @@ pub enum ServerError {
 
     #[error("rustls error: {0}")]
     Rustls(#[from] rustls::Error),
+
+    #[error("h3/WebTransport handshake timed out")]
+    HandshakeTimeout,
 }
 
 impl web_transport_trait::Error for SessionError {

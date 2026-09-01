@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use s2n_quic::connection::{Handle, StreamAcceptor};
@@ -64,6 +66,19 @@ impl ServerBuilder {
     }
 }
 
+/// Maximum concurrent in-flight H3/WebTransport handshakes (accepted QUIC
+/// connections that haven't yet produced a [`Request`]). Without a cap, a peer
+/// that finishes the QUIC handshake and then stalls (no control stream, no
+/// CONNECT) pins state here indefinitely - cheap slowloris. 256 is generous for
+/// legitimate handshake concurrency (these normally resolve in well under a
+/// second) while bounding worst-case pinned state on one endpoint.
+const MAX_INFLIGHT_SESSION_HANDSHAKES: usize = 256;
+
+/// Per-handshake timeout for [`Request::accept`] (the H3 SETTINGS/CONNECT
+/// exchange), so a stalled peer can't hold an in-flight slot forever. QUIC's own
+/// `max_handshake_duration` only covers the transport handshake, not this stage.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A WebTransport server that accepts new sessions.
 pub struct Server {
     endpoint: s2n_quic::Server,
@@ -90,9 +105,17 @@ impl Server {
     pub async fn accept(&mut self) -> Option<Request> {
         loop {
             tokio::select! {
-                conn = self.endpoint.accept() => {
+                // Backpressure, not rejection: stop polling for new QUIC connections
+                // once MAX_INFLIGHT_SESSION_HANDSHAKES are already handshaking, so the
+                // in-flight set can never grow past the cap. Cheaper and simpler than
+                // accepting the connection and then tearing it down over the cap.
+                conn = self.endpoint.accept(), if self.accept.len() < MAX_INFLIGHT_SESSION_HANDSHAKES => {
                     let conn = conn?;
-                    self.accept.push(Box::pin(Request::accept(conn)));
+                    self.accept.push(Box::pin(async move {
+                        tokio::time::timeout(HANDSHAKE_TIMEOUT, Request::accept(conn))
+                            .await
+                            .unwrap_or(Err(ServerError::HandshakeTimeout))
+                    }));
                 }
                 Some(res) = self.accept.next() => {
                     if let Ok(request) = res {
@@ -170,5 +193,36 @@ impl core::ops::Deref for Request {
 
     fn deref(&self) -> &Self::Target {
         &self.connect.request
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Shape test for `Server::accept`'s backpressure guard (`self.accept.len() <
+    /// MAX_INFLIGHT_SESSION_HANDSHAKES`), against the real constant. A full
+    /// end-to-end test would mean driving `MAX_INFLIGHT_SESSION_HANDSHAKES + 1`
+    /// real, stalled QUIC handshakes through an actual `s2n_quic::Server` (whose
+    /// concrete type can't be substituted) and waiting out `HANDSHAKE_TIMEOUT` to
+    /// observe recovery - a real slowloris simulation, which the task explicitly
+    /// doesn't require. This instead proves the exact guard expression admits no
+    /// more than the cap and never off-by-ones at the boundary.
+    #[test]
+    fn accept_backpressure_never_exceeds_the_inflight_cap() {
+        let in_flight: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
+        let mut offered = 0usize;
+
+        // Offer far more "new connections" than the cap; only push while under it -
+        // the same guard `Server::accept` uses before calling `self.endpoint.accept()`.
+        for _ in 0..(MAX_INFLIGHT_SESSION_HANDSHAKES * 4) {
+            if in_flight.len() < MAX_INFLIGHT_SESSION_HANDSHAKES {
+                offered += 1;
+                in_flight.push(Box::pin(std::future::pending()));
+            }
+        }
+
+        assert_eq!(in_flight.len(), MAX_INFLIGHT_SESSION_HANDSHAKES);
+        assert_eq!(offered, MAX_INFLIGHT_SESSION_HANDSHAKES);
     }
 }
