@@ -313,7 +313,7 @@ impl Session {
         self.handle
             .clone()
             .keep_alive(enabled)
-            .map_err(|e| SessionError::ConnectionError(e.into()))
+            .map_err(SessionError::ConnectionError)
     }
 
     /// Close the session with an error code and reason.
