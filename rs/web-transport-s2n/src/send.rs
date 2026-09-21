@@ -63,6 +63,34 @@ impl SendStream {
         self.stream.send(chunk).await.map_err(|e| self.map_error(e))
     }
 
+    /// Write some of the buffer to the stream, advancing it by the number of bytes
+    /// accepted and potentially avoiding a copy.
+    ///
+    /// # Cancel safety
+    ///
+    /// Send capacity is awaited before any byte is taken from `buf`, and the enqueue
+    /// that follows never yields, so dropping the returned future leaves `buf`
+    /// unadvanced.
+    pub async fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Result<usize, WriteError> {
+        if !buf.has_remaining() {
+            return Ok(0);
+        }
+
+        // Ready carries the capacity available now; s2n reports Pending when there is
+        // none, so this cannot hand back a zero-length write for a non-empty buffer.
+        let available = futures::future::poll_fn(|cx| self.stream.poll_send_ready(cx))
+            .await
+            .map_err(|e| self.map_error(e))?;
+
+        let size = buf.chunk().len().min(available);
+        let chunk = buf.copy_to_bytes(size);
+        self.stream
+            .send_data(chunk)
+            .map_err(|e| self.map_error(e))?;
+
+        Ok(size)
+    }
+
     /// Mark the stream as finished, such that no more data can be written.
     pub fn finish(&mut self) -> Result<(), WriteError> {
         self.stream
@@ -102,11 +130,7 @@ impl web_transport_trait::SendStream for SendStream {
     }
 
     async fn write_buf<B: Buf + Send>(&mut self, buf: &mut B) -> Result<usize, Self::Error> {
-        // Avoid a copy when the Buf is already Bytes.
-        let size = buf.chunk().len();
-        let chunk = buf.copy_to_bytes(size);
-        self.write_chunk(chunk).await?;
-        Ok(size)
+        Self::write_buf(self, buf).await
     }
 
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), Self::Error> {

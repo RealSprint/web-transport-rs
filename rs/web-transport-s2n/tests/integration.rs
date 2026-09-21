@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use url::Url;
 use web_transport_s2n::{
@@ -126,4 +126,39 @@ async fn graceful_close() {
         }
         other => panic!("unexpected close error: {other:?}"),
     }
+}
+
+/// Fill a stream until it stops accepting data, so the next write has to wait.
+async fn fill_until_blocked(send: &mut web_transport_s2n::SendStream) {
+    let chunk = Bytes::from(vec![0u8; 64 * 1024]);
+    for _ in 0..2048 {
+        if tokio::time::timeout(Duration::from_millis(200), send.write_chunk(chunk.clone()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    panic!("stream never stopped accepting data");
+}
+
+#[tokio::test]
+async fn a_cancelled_write_buf_leaves_the_buffer_unadvanced() {
+    let (client, _server, _guard) = connect().await;
+
+    // The peer never reads, so the stream runs out of send capacity and stays there.
+    let mut send = client.open_uni().await.expect("open uni");
+    fill_until_blocked(&mut send).await;
+
+    let mut buf = Bytes::from(vec![0xab; 4096]);
+    let remaining = buf.remaining();
+
+    let result = tokio::time::timeout(Duration::from_millis(200), send.write_buf(&mut buf)).await;
+
+    assert!(result.is_err(), "write_buf resolved on a blocked stream");
+    assert_eq!(
+        buf.remaining(),
+        remaining,
+        "a dropped write_buf consumed bytes it never sent"
+    );
 }
