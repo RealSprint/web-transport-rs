@@ -11,7 +11,10 @@ use bytes::{Bytes, BytesMut};
 use futures::stream::{FuturesUnordered, StreamExt};
 use s2n_quic::{
     connection::{BidirectionalStreamAcceptor, Handle, ReceiveStreamAcceptor, StreamAcceptor},
-    provider::datagram::default::{Receiver, Sender},
+    provider::{
+        datagram::default::{Receiver, Sender},
+        event::Location,
+    },
 };
 use tokio::sync::watch;
 
@@ -513,6 +516,10 @@ pub struct SessionAccept {
     accept_uni: ReceiveStreamAcceptor,
     accept_bi: BidirectionalStreamAcceptor,
 
+    // Set once the matching acceptor has reported end-of-stream, so it is not polled again.
+    accept_uni_done: bool,
+    accept_bi_done: bool,
+
     pending_uni: FuturesUnordered<Pin<Box<PendingUni>>>,
     pending_bi: FuturesUnordered<Pin<Box<PendingBi>>>,
 
@@ -539,6 +546,9 @@ impl SessionAccept {
             accept_uni,
             accept_bi,
 
+            accept_uni_done: false,
+            accept_bi_done: false,
+
             pending_uni: FuturesUnordered::new(),
             pending_bi: FuturesUnordered::new(),
 
@@ -547,24 +557,44 @@ impl SessionAccept {
         }
     }
 
+    /// The error to report once an acceptor has reached end-of-stream.
+    ///
+    /// s2n reports a clean close, an application close and an idle timeout as
+    /// end-of-stream rather than as an error, so the reason is whatever the
+    /// session's background task recorded. That task may not have run yet, in which
+    /// case all that is known is that the connection is gone.
+    fn accept_ended(&self) -> SessionError {
+        self.error
+            .get()
+            .cloned()
+            .unwrap_or_else(|| s2n_quic::connection::Error::closed(Location::Remote).into())
+    }
+
     pub fn poll_accept_uni(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<RecvStream, SessionError>> {
         loop {
-            if let Poll::Ready(Some(res)) = self.accept_uni.poll_next_unpin(cx) {
-                let recv = match res {
-                    Ok(recv) => recv,
-                    Err(e) => {
-                        for waker in self.uni_wakers.drain(..) {
-                            waker.wake();
-                        }
-                        return Poll::Ready(Err(e.into()));
+            if !self.accept_uni_done {
+                match self.accept_uni.poll_next_unpin(cx) {
+                    Poll::Ready(Some(res)) => {
+                        let recv = match res {
+                            Ok(recv) => recv,
+                            Err(e) => {
+                                for waker in self.uni_wakers.drain(..) {
+                                    waker.wake();
+                                }
+                                return Poll::Ready(Err(e.into()));
+                            }
+                        };
+                        let pending = Self::decode_uni(recv, self.session_id);
+                        self.pending_uni.push(Box::pin(pending));
+                        continue;
                     }
-                };
-                let pending = Self::decode_uni(recv, self.session_id);
-                self.pending_uni.push(Box::pin(pending));
-                continue;
+                    // Decode the headers still in flight before reporting the end.
+                    Poll::Ready(None) => self.accept_uni_done = true,
+                    Poll::Pending => {}
+                }
             }
 
             let (typ, recv) = match self.pending_uni.poll_next_unpin(cx) {
@@ -572,6 +602,12 @@ impl SessionAccept {
                 Poll::Ready(Some(Err(err))) => {
                     tracing::warn!(?err, "failed to decode unidirectional stream");
                     continue;
+                }
+                Poll::Ready(None) if self.accept_uni_done => {
+                    for waker in self.uni_wakers.drain(..) {
+                        waker.wake();
+                    }
+                    return Poll::Ready(Err(self.accept_ended()));
                 }
                 Poll::Ready(None) | Poll::Pending => {
                     if !self.uni_wakers.iter().any(|w| w.will_wake(cx.waker())) {
@@ -628,19 +664,26 @@ impl SessionAccept {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
         loop {
-            if let Poll::Ready(Some(res)) = self.accept_bi.poll_next_unpin(cx) {
-                let stream = match res {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        for waker in self.bi_wakers.drain(..) {
-                            waker.wake();
-                        }
-                        return Poll::Ready(Err(e.into()));
+            if !self.accept_bi_done {
+                match self.accept_bi.poll_next_unpin(cx) {
+                    Poll::Ready(Some(res)) => {
+                        let stream = match res {
+                            Ok(stream) => stream,
+                            Err(e) => {
+                                for waker in self.bi_wakers.drain(..) {
+                                    waker.wake();
+                                }
+                                return Poll::Ready(Err(e.into()));
+                            }
+                        };
+                        let pending = Self::decode_bi(stream, self.session_id);
+                        self.pending_bi.push(Box::pin(pending));
+                        continue;
                     }
-                };
-                let pending = Self::decode_bi(stream, self.session_id);
-                self.pending_bi.push(Box::pin(pending));
-                continue;
+                    // Decode the headers still in flight before reporting the end.
+                    Poll::Ready(None) => self.accept_bi_done = true,
+                    Poll::Pending => {}
+                }
             }
 
             let res = match self.pending_bi.poll_next_unpin(cx) {
@@ -648,6 +691,12 @@ impl SessionAccept {
                 Poll::Ready(Some(Err(err))) => {
                     tracing::warn!(?err, "failed to decode bidirectional stream");
                     continue;
+                }
+                Poll::Ready(None) if self.accept_bi_done => {
+                    for waker in self.bi_wakers.drain(..) {
+                        waker.wake();
+                    }
+                    return Poll::Ready(Err(self.accept_ended()));
                 }
                 Poll::Ready(None) | Poll::Pending => {
                     if !self.bi_wakers.iter().any(|w| w.will_wake(cx.waker())) {
