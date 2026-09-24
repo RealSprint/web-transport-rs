@@ -186,7 +186,10 @@ impl ServerError {
     /// arrived: a close with no error code, or the idle timer expiring.
     ///
     /// This is what a peer that only checks QUIC reachability looks like, as
-    /// opposed to a protocol error or a close carrying an error code.
+    /// opposed to a protocol error or a close carrying an error code. A peer
+    /// that closes before the handshake is confirmed can only send a transport
+    /// `APPLICATION_ERROR`, which s2n reports as a clean close, so its
+    /// application code is not visible here and it counts as abandoned.
     pub fn is_abandoned(&self) -> bool {
         match self {
             // s2n reports a clean close or an idle timeout as end-of-stream on
@@ -206,8 +209,8 @@ fn is_clean_close(error: &s2n_quic::connection::Error) -> bool {
     use s2n_quic::connection::Error;
     match error {
         Error::Closed { .. } | Error::IdleTimerExpired { .. } => true,
+        // A transport NO_ERROR close already arrives as `Closed`.
         Error::Application { error, .. } => matches!(u64::from(*error), 0 | H3_NO_ERROR),
-        Error::Transport { code, .. } => code.as_u64() == 0,
         _ => false,
     }
 }
