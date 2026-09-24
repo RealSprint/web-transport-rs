@@ -163,6 +163,7 @@ pub struct HandshakeCounters {
     completed: AtomicU64,
     rejected: AtomicU64,
     timed_out: AtomicU64,
+    abandoned: AtomicU64,
     failed: AtomicU64,
     inflight: AtomicUsize,
     inflight_high_water: AtomicUsize,
@@ -179,7 +180,10 @@ pub struct HandshakeStats {
     pub rejected: u64,
     /// Handshakes that hit [`HandshakeLimits::timeout`].
     pub timed_out: u64,
-    /// Handshakes that ended in any other error (peer closed, protocol error).
+    /// Connections that ended without an error before sending a CONNECT request,
+    /// such as a reachability check; see [`ServerError::is_abandoned`].
+    pub abandoned: u64,
+    /// Handshakes that ended in any other error (protocol error, close with an error code).
     pub failed: u64,
     /// Handshakes in flight as of the last `Server::accept` poll.
     pub inflight: usize,
@@ -196,6 +200,7 @@ impl HandshakeCounters {
             completed: self.completed.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
             timed_out: self.timed_out.load(Ordering::Relaxed),
+            abandoned: self.abandoned.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
             inflight: self.inflight.load(Ordering::Relaxed),
             inflight_high_water: self.inflight_high_water.load(Ordering::Relaxed),
@@ -318,6 +323,9 @@ impl Server {
                         }
                         Err(ServerError::HandshakeTimeout) => {
                             self.counters.timed_out.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(error) if error.is_abandoned() => {
+                            self.counters.abandoned.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(_) => {
                             self.counters.failed.fetch_add(1, Ordering::Relaxed);

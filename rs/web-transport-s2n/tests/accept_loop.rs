@@ -217,7 +217,9 @@ async fn connections_over_the_cap_are_rejected_until_a_slot_frees() {
 
     // The occupant leaving frees the slot without waiting for the timeout.
     occupant.close(s2n_quic::application::Error::new(0).unwrap());
-    let stats = h.wait_for(Duration::from_secs(5), |s| s.failed == 1).await;
+    let stats = h
+        .wait_for(Duration::from_secs(5), |s| s.abandoned == 1)
+        .await;
     assert_eq!(stats.inflight, 0);
     assert_eq!(stats.timed_out, 0);
 
@@ -271,7 +273,9 @@ async fn a_paused_consumer_drains_its_backlog_without_exceeding_the_cap() {
     for peer in peers.drain(..) {
         peer.close(s2n_quic::application::Error::new(0).unwrap());
     }
-    let stats = h.wait_for(Duration::from_secs(5), |s| s.failed == 4).await;
+    let stats = h
+        .wait_for(Duration::from_secs(5), |s| s.abandoned == 4)
+        .await;
     assert_eq!(stats.inflight, 0);
 
     let client = h.real_client();
@@ -335,4 +339,45 @@ async fn completions_are_returned_while_a_burst_is_being_dequeued() {
         "the burst must have overlapped in the driven set"
     );
     drop(peers);
+}
+
+#[tokio::test]
+async fn a_peer_that_closes_before_connect_counts_as_abandoned_not_failed() {
+    let limits = HandshakeLimits {
+        max_inflight: 8,
+        timeout: Duration::from_secs(10),
+    };
+    let mut h = Harness::new(limits);
+    let _requests = h.spawn_accept();
+
+    // A reachability check: finish QUIC, then close with no error code.
+    let probe = h.stalled_peer().await;
+    h.wait_for(Duration::from_secs(2), |s| s.inflight == 1)
+        .await;
+    probe.close(s2n_quic::application::Error::new(0).unwrap());
+    let stats = h
+        .wait_for(Duration::from_secs(5), |s| s.abandoned == 1)
+        .await;
+    assert_eq!(stats.failed, 0);
+
+    // The same with H3_NO_ERROR.
+    let probe = h.stalled_peer().await;
+    h.wait_for(Duration::from_secs(2), |s| s.inflight == 1)
+        .await;
+    probe.close(s2n_quic::application::Error::new(0x0100).unwrap());
+    let stats = h
+        .wait_for(Duration::from_secs(5), |s| s.abandoned == 2)
+        .await;
+    assert_eq!(stats.failed, 0);
+
+    // A close that carries an error code is still a failure.
+    let peer = h.stalled_peer().await;
+    h.wait_for(Duration::from_secs(2), |s| s.inflight == 1)
+        .await;
+    // H3_GENERAL_PROTOCOL_ERROR
+    peer.close(s2n_quic::application::Error::new(0x0101).unwrap());
+    let stats = h.wait_for(Duration::from_secs(5), |s| s.failed == 1).await;
+    assert_eq!(stats.abandoned, 2);
+    assert_eq!(stats.inflight, 0);
+    assert_eq!(stats.timed_out, 0);
 }

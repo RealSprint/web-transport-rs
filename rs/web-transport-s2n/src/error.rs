@@ -178,6 +178,40 @@ pub enum ServerError {
     HandshakeTimeout,
 }
 
+/// `H3_NO_ERROR` (RFC 9114, section 8.1).
+const H3_NO_ERROR: u64 = 0x0100;
+
+impl ServerError {
+    /// Whether the connection ended without an error before a CONNECT request
+    /// arrived: a close with no error code, or the idle timer expiring.
+    ///
+    /// This is what a peer that only checks QUIC reachability looks like, as
+    /// opposed to a protocol error or a close carrying an error code.
+    pub fn is_abandoned(&self) -> bool {
+        match self {
+            // s2n reports a clean close or an idle timeout as end-of-stream on
+            // the stream acceptors, which the handshake maps to `UnexpectedEnd`.
+            Self::UnexpectedEnd
+            | Self::SettingsError(SettingsError::UnexpectedEnd)
+            | Self::ConnectError(ConnectError::UnexpectedEnd) => true,
+            Self::Connection(error)
+            | Self::SettingsError(SettingsError::ConnectionError(error))
+            | Self::ConnectError(ConnectError::ConnectionError(error)) => is_clean_close(error),
+            _ => false,
+        }
+    }
+}
+
+fn is_clean_close(error: &s2n_quic::connection::Error) -> bool {
+    use s2n_quic::connection::Error;
+    match error {
+        Error::Closed { .. } | Error::IdleTimerExpired { .. } => true,
+        Error::Application { error, .. } => matches!(u64::from(*error), 0 | H3_NO_ERROR),
+        Error::Transport { code, .. } => code.as_u64() == 0,
+        _ => false,
+    }
+}
+
 impl web_transport_trait::Error for SessionError {
     fn session_error(&self) -> Option<(u32, String)> {
         if let SessionError::WebTransportError(WebTransportError::Closed(code, reason)) = self {
