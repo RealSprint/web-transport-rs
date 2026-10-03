@@ -13,7 +13,6 @@
 //!
 //! s2n-quic differs from Quinn in a few ways that affect this crate:
 //!   - TLS is configured via a [`s2n_quic::provider::tls::Provider`]; we build one from rustls.
-//!   - Streams have no priority knob, so [`SendStream::set_priority`] is a no-op.
 //!   - Datagram support requires the (unstable) default datagram provider, enabled here.
 
 // External

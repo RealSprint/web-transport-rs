@@ -20,3 +20,13 @@ web-transport-proto = { path = "rs/web-transport-proto", version = "0.6" }
 web-transport-quinn = { path = "rs/web-transport-quinn", version = "0.11", default-features = false }
 web-transport-trait = { path = "rs/web-transport-trait", version = "0.3" }
 
+
+# s2n-quic from RealSprint/s2n-quic for SendStream::set_priority.
+[patch.crates-io]
+s2n-codec = { git = "https://github.com/RealSprint/s2n-quic", rev = "307cdbbc94b9e24b27c7823cd4722772c4c44163" }
+s2n-quic = { git = "https://github.com/RealSprint/s2n-quic", rev = "307cdbbc94b9e24b27c7823cd4722772c4c44163" }
+s2n-quic-core = { git = "https://github.com/RealSprint/s2n-quic", rev = "307cdbbc94b9e24b27c7823cd4722772c4c44163" }
+s2n-quic-crypto = { git = "https://github.com/RealSprint/s2n-quic", rev = "307cdbbc94b9e24b27c7823cd4722772c4c44163" }
+s2n-quic-platform = { git = "https://github.com/RealSprint/s2n-quic", rev = "307cdbbc94b9e24b27c7823cd4722772c4c44163" }
+s2n-quic-rustls = { git = "https://github.com/RealSprint/s2n-quic", rev = "307cdbbc94b9e24b27c7823cd4722772c4c44163" }
+s2n-quic-transport = { git = "https://github.com/RealSprint/s2n-quic", rev = "307cdbbc94b9e24b27c7823cd4722772c4c44163" }

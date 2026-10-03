@@ -39,6 +39,11 @@ impl SendStream {
         let _ = self.stream.reset(app_error(code));
     }
 
+    /// Set the send priority. Streams with a higher value are sent first; the default is `0`.
+    pub fn set_priority(&mut self, order: i32) -> Result<(), WriteError> {
+        self.stream.set_priority(order).map_err(|e| self.map_error(e))
+    }
+
     /// Write some data to the stream, returning the number of bytes written.
     ///
     /// s2n-quic's [`s2n_quic::stream::SendStream::send`] enqueues the entire buffer, so this
@@ -113,8 +118,8 @@ impl SendStream {
 impl web_transport_trait::SendStream for SendStream {
     type Error = WriteError;
 
-    fn set_priority(&mut self, _order: u8) {
-        // s2n-quic does not expose a per-stream priority knob.
+    fn set_priority(&mut self, order: u8) {
+        Self::set_priority(self, order.into()).ok();
     }
 
     fn reset(&mut self, code: u32) {
