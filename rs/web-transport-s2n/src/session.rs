@@ -196,12 +196,22 @@ impl Session {
 
     /// Open a new unidirectional stream.
     pub async fn open_uni(&self) -> Result<SendStream, SessionError> {
+        self.open_uni_with_priority(0).await
+    }
+
+    /// Open a new unidirectional stream with a send priority, see [`SendStream::set_priority`].
+    ///
+    /// The priority is set before the stream header is queued, so streams of one priority
+    /// are sent in the order they were opened.
+    pub async fn open_uni_with_priority(&self, priority: i32) -> Result<SendStream, SessionError> {
         let mut handle = self.handle.clone();
         let mut send = handle
             .open_send_stream()
             .await
             .map_err(SessionError::from)?;
 
+        send.set_priority(priority)
+            .map_err(|e| self.map_stream_error(e))?;
         send.send(Bytes::copy_from_slice(&self.header_uni))
             .await
             .map_err(|e| self.map_stream_error(e))?;
